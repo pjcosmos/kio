@@ -54,7 +54,7 @@ button {
 /* === 스냅샷 고정 모드 === */
 #ar-overlay.frozen {
     /* recognizeTextAndFreeze()에서 설정한 dataURL을 배경으로 씀 */
-    background-size: 100% 100%;      /* 컨테이너 꽉 채우기 */
+    background-size: cover;      /* 컨테이너 꽉 채우기 */
     background-position: center; /* 중앙 정렬 */
     background-repeat: no-repeat;
 }
