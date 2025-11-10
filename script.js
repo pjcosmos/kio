@@ -1,6 +1,5 @@
 // 1. 설정: 인식할 키워드를 이곳에 추가하거나 수정하세요.
-const TARGET_WORDS = ['버거', '음료', '주문', '결제'];
-
+const TARGET_WORDS = ['버거','음료','주문','결제','변경안함','버터번','세트','단품'];
 // ===== 주문 단계(state) & 주문 정보 =====
 const STEPS = {
     IDLE: 'IDLE',
@@ -15,6 +14,17 @@ const STEPS = {
 
 
 let currentStep = STEPS.IDLE;
+let isFrozen = false;          // 고정 모드 여부
+let lastSnapshotUrl = null;    // 메모리 누수 방지용 (revoke할 URL)
+let scanning = false;
+
+async function safeScan(fn){
+  if (scanning) return;
+  scanning = true;
+  try { await fn(); }
+  finally { scanning = false; }
+}
+
 
 const order = {
     menu: null,
@@ -41,6 +51,54 @@ const arOverlay = document.getElementById('ar-overlay');
 let worker;
 let stream;
 
+function freezeSnapshot(sourceCanvas) {
+    // 기존 스냅샷 URL 정리
+    if (lastSnapshotUrl) {
+      URL.revokeObjectURL(lastSnapshotUrl);
+      lastSnapshotUrl = null;
+    }
+  
+    // 캔버스를 Blob → ObjectURL로 만들어 고화질 유지
+    sourceCanvas.toBlob(blob => {
+      const url = URL.createObjectURL(blob);
+      lastSnapshotUrl = url;
+  
+      // 오버레이를 "스냅샷 배경"으로 만들고, 비디오를 숨김
+      arOverlay.classList.add('frozen');
+      arOverlay.style.backgroundImage = `url(${url})`;
+      arOverlay.style.backgroundRepeat = 'no-repeat';
+  
+      // 오버레이의 크기를 비디오와 동일하게 보장
+      // (이미 CSS/레이아웃으로 겹쳐져 있다면 생략 가능)
+      arOverlay.style.width  = `${video.clientWidth}px`;
+      arOverlay.style.height = `${video.clientHeight}px`;
+  
+      video.classList.add('hidden');  // 비디오 숨기기 (스트림은 유지)
+  
+      isFrozen = true;
+      scanButton.textContent = '해제';
+    }, 'image/png', 0.95);
+  }
+  
+  function unfreezeSnapshot() {
+    // 배경이미지 제거 + 오버레이 클리어 + 비디오 표시
+    arOverlay.classList.remove('frozen');
+    arOverlay.style.backgroundImage = '';
+    arOverlay.innerHTML = '';
+  
+    video.classList.remove('hidden');
+  
+    if (lastSnapshotUrl) {
+      URL.revokeObjectURL(lastSnapshotUrl);
+      lastSnapshotUrl = null;
+    }
+  
+    isFrozen = false;
+    scanButton.textContent = '스캔';
+    ocrOutput.textContent = '라이브로 돌아왔습니다. 화면을 맞추고 스캔을 눌러주세요.';
+  }
+  
+
 // 3. Tesseract.js 초기화
 async function initializeTesseract() {
     ocrOutput.textContent = 'OCR 엔진을 로딩 중입니다...';
@@ -48,11 +106,15 @@ async function initializeTesseract() {
         worker = await Tesseract.createWorker('kor');
 
         await worker.setParameters({
-            tessedit_char_whitelist: 
-                '리아불고기버거데리새우핫크리스피치즈한우전주비빔라이스 0123456789' +
-                '변경안함버터번단품세트디저트치킨음료커피포테이토콜라사이다',    
-            tessedit_pageseg_mode: '6', // 일반 블록 텍스트(문장) 모드
-        });
+            tessedit_char_whitelist:
+              '롯데리아리아불고기버거데리새우핫크리스피치즈한우전주비빔라이스' +
+              '변경안함버터번단품세트디저트치킨음료커피포테이토콜라사이다' +
+              '주문확인결제장바구니다음이전+원0123456789',
+            tessedit_pageseg_mode: '6',
+            user_defined_dpi: '300',
+            preserve_interword_spaces: '1',
+          });
+          
 
         ocrOutput.textContent = 'OCR 엔진 로딩 완료. 카메라를 켜고 스캔 버튼을 누르세요.';
     } catch (error) {
@@ -64,7 +126,9 @@ initializeTesseract();
 
 // 4. 카메라 켜기 버튼 이벤트 리스너
 cameraButton.addEventListener('click', async () => {
-    if (stream) {
+    if (isFrozen) unfreezeSnapshot(); // 고정 상태면 먼저 해제
+
+      if (stream) {
         // 카메라 끄기
         stream.getTracks().forEach(track => track.stop());
         video.srcObject = null;
@@ -101,8 +165,16 @@ cameraButton.addEventListener('click', async () => {
 });
 
 // 5. 스캔 버튼 이벤트 리스너
-scanButton.addEventListener('click', recognizeText);
-
+scanButton.addEventListener('click', () => {
+    if (!isFrozen) {
+      // 라이브 상태에서 스냅샷 + 고정
+      safeScan(recognizeTextAndFreeze);
+    } else {
+      // 고정 해제 → 라이브 복귀
+      unfreezeSnapshot();
+    }
+  });
+  
 
 // 6. 텍스트 인식 함수
 async function recognizeText() {
@@ -158,30 +230,23 @@ async function recognizeText() {
 
     // 인식된 단어 위에 AR 화살표 표시
     let activeTargets = TARGET_WORDS;
-    
-    // 1) 카테고리 단계: '버거'
-    if (currentStep === STEPS.MENU_CATEGORY) {
-        activeTargets = ['버거'];
-    }
-    // 2) 메뉴 아이템 단계: 메뉴 키워드
-    else if (currentStep === STEPS.MENU_ITEM && order.menuKeyword) {
-        activeTargets = [order.menuKeyword];
-    }
-    // 3) 빵 선택 단계: '변경안함' 또는 '버터번'
-    else if (currentStep === STEPS.BUN && order.bunKeyword) {
-        activeTargets = [order.bunKeyword];   // '변경안함' 또는 '버터번'
-    }
-    // 4) 세트/단품 단계
-    else if (currentStep === STEPS.SET_OR_SINGLE && order.isSet !== null) {
-        activeTargets = order.isSet ? ['세트'] : ['단품'];
-    }
-
+if (currentStep === STEPS.MENU_CATEGORY) {
+   activeTargets = ['버거'];
+ } else if (currentStep === STEPS.MENU_ITEM && order.menuKeyword) {
+   activeTargets = [order.menuKeyword];
+ } else if (currentStep === STEPS.BUN) {
+   // 선택 전에도 두 버튼 모두를 잡게 기본 타깃 제공
+   activeTargets = order.bunKeyword ? [order.bunKeyword] : ['변경안함','버터번'];
+ } else if (currentStep === STEPS.SET_OR_SINGLE) {
+   activeTargets = order.isSet === null ? ['세트','단품'] : (order.isSet ? ['세트'] : ['단품']);
+ }
 
     words.forEach(word => {
         const text = (word.text || '').trim();
+        const compactText = text.replace(/\s+/g, ''); // ← '버 터 번' → '버터번'
 
-        if (activeTargets.some(target => text.includes(target))) {
-            matchedCount++;
+        if (activeTargets.some(target => compactText.includes(target))) {         
+               matchedCount++;
 
             const div = document.createElement('div');
             div.className = 'ar-arrow';
@@ -203,6 +268,75 @@ async function recognizeText() {
 
     ocrOutput.textContent = `인식 완료: 강조된 영역 ${matchedCount}개`;
 }
+
+async function recognizeTextAndFreeze() {
+    if (!worker) { alert('OCR 엔진이 아직 준비되지 않았습니다.'); return; }
+    if (!stream) { alert('카메라가 켜져 있지 않습니다.'); return; }
+  
+    ocrOutput.textContent = '텍스트를 인식 중입니다...';
+  
+    const canvas = document.createElement('canvas');
+    const scaleForOCR = 2; // 고해상도 캡처
+    canvas.width  = video.videoWidth  * scaleForOCR;
+    canvas.height = video.videoHeight * scaleForOCR;
+  
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  
+    // (선택) 간단 전처리: 흑백 + 약간 대비
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      const avg = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
+      let enhanced = avg * 1.2; if (enhanced > 255) enhanced = 255;
+      data[i] = data[i+1] = data[i+2] = enhanced;
+    }
+    context.putImageData(imageData, 0, 0);
+  
+    // OCR
+    const { data: { text, words } } = await worker.recognize(canvas);
+    console.log('OCR words:', words.map(w => w.text));
+  
+    // 오버레이 초기화
+    arOverlay.innerHTML = '';
+  
+    // 현재 단계별 타깃
+    const activeTargets = (typeof getActiveTargets === 'function')
+      ? getActiveTargets()
+      : TARGET_WORDS;
+  
+    // 비디오 크기에 맞춘 스케일
+    const scaleX = video.clientWidth  / canvas.width;
+    const scaleY = video.clientHeight / canvas.height;
+  
+    let matchedCount = 0;
+  
+    words.forEach(word => {
+      const raw = (word.text || '').trim();
+      const compactText = raw.replace(/\s+/g, ''); // '버 터 번' → '버터번'
+  
+      if (activeTargets.some(t => compactText.includes(t))) {
+        matchedCount++;
+  
+        const div = document.createElement('div');
+        div.className = 'ar-arrow';
+        div.style.position = 'absolute';
+        div.style.left   = `${word.bbox.x0 * scaleX}px`;
+        div.style.top    = `${word.bbox.y0 * scaleY}px`;
+        div.style.width  = `${(word.bbox.x1 - word.bbox.x0) * scaleX}px`;
+        div.style.height = `${(word.bbox.y1 - word.bbox.y0) * scaleY}px`;
+        div.title = raw;
+  
+        arOverlay.appendChild(div);
+      }
+    });
+  
+    // === 여기서 "고정" ===
+    freezeSnapshot(canvas);
+  
+    ocrOutput.textContent = `인식 완료(고정됨): 강조된 영역 ${matchedCount}개`;
+  }
+  
 
 // 7. 음성 인식 기능
 const voiceButton = document.getElementById('voiceButton');
