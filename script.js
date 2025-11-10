@@ -77,6 +77,7 @@ function freezeSnapshot(sourceCanvas) {
   
       isFrozen = true;
       scanButton.textContent = '해제';
+        ensureFreezeToolbar();
     }, 'image/png', 0.95);
   }
   
@@ -85,6 +86,7 @@ function freezeSnapshot(sourceCanvas) {
     arOverlay.classList.remove('frozen');
     arOverlay.style.backgroundImage = '';
     arOverlay.innerHTML = '';
+      removeFreezeToolbar();
   
     video.classList.remove('hidden');
   
@@ -97,7 +99,48 @@ function freezeSnapshot(sourceCanvas) {
     scanButton.textContent = '스캔';
     ocrOutput.textContent = '라이브로 돌아왔습니다. 화면을 맞추고 스캔을 눌러주세요.';
   }
-  
+
+function ensureFreezeToolbar() {
+  let bar = document.getElementById('freeze-toolbar');
+  if (bar) return bar;
+
+  bar = document.createElement('div');
+  bar.id = 'freeze-toolbar';
+  bar.innerHTML = `
+    <button id="btn-unfreeze">해제</button>
+  `;
+  // 오버레이 위에서만 클릭 가능
+  bar.style.position = 'absolute';
+  bar.style.top = '12px';
+  bar.style.right = '12px';
+  bar.style.zIndex = '9999';
+  bar.style.pointerEvents = 'auto';
+  bar.style.display = 'flex';
+  bar.style.gap = '8px';
+
+  const btn = bar.querySelector('#btn-unfreeze');
+  Object.assign(btn.style, {
+    padding: '8px 12px',
+    fontSize: '14px',
+    borderRadius: '8px',
+    border: '1px solid #ccc',
+    background: '#ffffffcc',
+    backdropFilter: 'blur(4px)',
+    cursor: 'pointer'
+  });
+  btn.onclick = unfreezeSnapshot;
+
+  // 오버레이는 pointer-events:none 이라 클릭이 안 먹히므로
+  // 툴바가 클릭되도록 오버레이에 예외로 삽입
+  arOverlay.appendChild(bar);
+  return bar;
+}
+
+function removeFreezeToolbar() {
+  const bar = document.getElementById('freeze-toolbar');
+  if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
+}
+
 
 // 3. Tesseract.js 초기화
 async function initializeTesseract() {
@@ -270,72 +313,79 @@ if (currentStep === STEPS.MENU_CATEGORY) {
 }
 
 async function recognizeTextAndFreeze() {
-    if (!worker) { alert('OCR 엔진이 아직 준비되지 않았습니다.'); return; }
-    if (!stream) { alert('카메라가 켜져 있지 않습니다.'); return; }
-  
-    ocrOutput.textContent = '텍스트를 인식 중입니다...';
-  
-    const canvas = document.createElement('canvas');
-    const scaleForOCR = 2; // 고해상도 캡처
-    canvas.width  = video.videoWidth  * scaleForOCR;
-    canvas.height = video.videoHeight * scaleForOCR;
-  
-    const context = canvas.getContext('2d', { willReadFrequently: true });
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-  
-    // (선택) 간단 전처리: 흑백 + 약간 대비
-    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-    const data = imageData.data;
-    for (let i = 0; i < data.length; i += 4) {
-      const avg = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
-      let enhanced = avg * 1.2; if (enhanced > 255) enhanced = 255;
-      data[i] = data[i+1] = data[i+2] = enhanced;
-    }
-    context.putImageData(imageData, 0, 0);
-  
-    // OCR
-    const { data: { text, words } } = await worker.recognize(canvas);
-    console.log('OCR words:', words.map(w => w.text));
-  
-    // 오버레이 초기화
-    arOverlay.innerHTML = '';
-  
-    // 현재 단계별 타깃
-    const activeTargets = (typeof getActiveTargets === 'function')
-      ? getActiveTargets()
-      : TARGET_WORDS;
-  
-    // 비디오 크기에 맞춘 스케일
-    const scaleX = video.clientWidth  / canvas.width;
-    const scaleY = video.clientHeight / canvas.height;
-  
-    let matchedCount = 0;
-  
-    words.forEach(word => {
-      const raw = (word.text || '').trim();
-      const compactText = raw.replace(/\s+/g, ''); // '버 터 번' → '버터번'
-  
-      if (activeTargets.some(t => compactText.includes(t))) {
-        matchedCount++;
-  
-        const div = document.createElement('div');
-        div.className = 'ar-arrow';
-        div.style.position = 'absolute';
-        div.style.left   = `${word.bbox.x0 * scaleX}px`;
-        div.style.top    = `${word.bbox.y0 * scaleY}px`;
-        div.style.width  = `${(word.bbox.x1 - word.bbox.x0) * scaleX}px`;
-        div.style.height = `${(word.bbox.y1 - word.bbox.y0) * scaleY}px`;
-        div.title = raw;
-  
-        arOverlay.appendChild(div);
-      }
-    });
-  
-    // === 여기서 "고정" ===
-    freezeSnapshot(canvas);
-  
-    ocrOutput.textContent = `인식 완료(고정됨): 강조된 영역 ${matchedCount}개`;
+  if (!worker) { alert('OCR 엔진이 아직 준비되지 않았습니다.'); return; }
+  if (!stream) { alert('카메라가 켜져 있지 않습니다.'); return; }
+
+  ocrOutput.textContent = '텍스트를 인식 중입니다...';
+
+  const scaleForOCR = 2;
+
+  // 1) 스냅샷(컬러)용 캔버스
+  const snapCanvas = document.createElement('canvas');
+  snapCanvas.width  = video.videoWidth;
+  snapCanvas.height = video.videoHeight;
+  const snapCtx = snapCanvas.getContext('2d', { willReadFrequently: true });
+  snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
+
+  // 2) OCR(흑백 전처리)용 캔버스
+  const ocrCanvas = document.createElement('canvas');
+  ocrCanvas.width  = video.videoWidth  * scaleForOCR;
+  ocrCanvas.height = video.videoHeight * scaleForOCR;
+  const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+  ocrCtx.drawImage(video, 0, 0, ocrCanvas.width, ocrCanvas.height);
+
+  // 전처리(흑백+대비) — OCR 캔버스만
+  const imageData = ocrCtx.getImageData(0, 0, ocrCanvas.width, ocrCanvas.height);
+  const data = imageData.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const avg = data[i] * 0.299 + data[i+1] * 0.587 + data[i+2] * 0.114;
+    let enhanced = avg * 1.2; if (enhanced > 255) enhanced = 255;
+    data[i] = data[i+1] = data[i+2] = enhanced;
   }
+  ocrCtx.putImageData(imageData, 0, 0);
+
+  // 3) OCR 실행은 ocrCanvas로
+  const { data: { words } } = await worker.recognize(ocrCanvas);
+  console.log('OCR words:', words.map(w => w.text));
+
+  // 4) 오버레이 갱신
+  arOverlay.innerHTML = '';
+
+  // 현재 단계별 타깃
+  const activeTargets = (typeof getActiveTargets === 'function') ? getActiveTargets() : TARGET_WORDS;
+
+  // 좌표 스케일(스냅샷은 원본 비디오 크기 기준으로 고정할 것)
+  const scaleX = video.clientWidth  / ocrCanvas.width;
+  const scaleY = video.clientHeight / ocrCanvas.height;
+
+  let matchedCount = 0;
+
+  words.forEach(word => {
+    const raw = (word.text || '').trim();
+    const compactText = raw.replace(/\s+/g, '');
+
+    if (activeTargets.some(t => compactText.includes(t))) {
+      matchedCount++;
+
+      const div = document.createElement('div');
+      div.className = 'ar-arrow';
+      div.style.position = 'absolute';
+      div.style.left   = `${word.bbox.x0 * scaleX}px`;
+      div.style.top    = `${word.bbox.y0 * scaleY}px`;
+      div.style.width  = `${(word.bbox.x1 - word.bbox.x0) * scaleX}px`;
+      div.style.height = `${(word.bbox.y1 - word.bbox.y0) * scaleY}px`;
+      div.title = raw;
+
+      arOverlay.appendChild(div);
+    }
+  });
+
+  // 5) 컬러 스냅샷으로 배경 고정
+  freezeSnapshot(snapCanvas);
+
+  ocrOutput.textContent = `인식 완료(고정됨): 강조된 영역 ${matchedCount}개`;
+}
+
   
 
 // 7. 음성 인식 기능
